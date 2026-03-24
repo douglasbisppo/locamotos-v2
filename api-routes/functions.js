@@ -289,11 +289,16 @@ router.post('/mercadopago-webhook', async (req, res) => {
           [contract.id, refData.valorSemanal, vencimento.toISOString().split('T')[0], today.toISOString().split('T')[0]]
         );
 
-        // Trigger clicksign envelope creation (non-blocking)
+        // Trigger clicksign envelope creation (non-blocking, internal call)
+        // Uses INTERNAL_API_KEY to authenticate since clicksign-create-envelope now requires auth
         const apiBase = process.env.API_BASE_URL || 'http://localhost:3002';
+        const internalToken = process.env.INTERNAL_API_TOKEN || '';
         fetch(`${apiBase}/api/functions/clicksign-create-envelope`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${internalToken}`,
+          },
           body: JSON.stringify({ contractId: contract.id }),
         }).catch(err => console.error('Clicksign trigger error:', err));
       }
@@ -500,7 +505,7 @@ async function uploadHtmlDocumentWithFallback(envelopeId, filenameBase, html) {
 }
 
 // ─── POST /api/functions/clicksign-create-envelope ───────────────────────────
-router.post('/clicksign-create-envelope', async (req, res) => {
+router.post('/clicksign-create-envelope', requireAuth, async (req, res) => {
   try {
     const { contractId } = req.body;
     if (!contractId) return res.status(400).json({ error: 'contractId é obrigatório' });
@@ -1129,11 +1134,39 @@ router.post("/whatsapp-bot", async (req, res) => {
 
 
 
+// ─── Rate Limiter (in-memory, per-process) ────────────────────────────────────
+const otpRateLimit = new Map(); // key -> { count, firstAttempt }
+
+function checkOtpRateLimit(identifier, maxAttempts = 5, windowMs = 10 * 60 * 1000) {
+  const now = Date.now();
+  const entry = otpRateLimit.get(identifier);
+  if (!entry || (now - entry.firstAttempt) > windowMs) {
+    otpRateLimit.set(identifier, { count: 1, firstAttempt: now });
+    return true;
+  }
+  if (entry.count >= maxAttempts) return false;
+  entry.count++;
+  return true;
+}
+
+// Clean up rate limit map every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of otpRateLimit) {
+    if (now - val.firstAttempt > 15 * 60 * 1000) otpRateLimit.delete(key);
+  }
+}, 30 * 60 * 1000);
+
 // ─── POST /api/functions/send-email-otp ──────────────────────────────────────
 router.post('/send-email-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email || !email.includes('@')) return res.status(400).json({ error: 'E-mail inválido' });
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!email || !emailRegex.test(email)) return res.status(400).json({ error: 'E-mail inválido' });
+
+    if (!checkOtpRateLimit(`email:${email.toLowerCase()}`)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    }
 
     const code = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
@@ -1174,6 +1207,10 @@ router.post('/generate-whatsapp-otp', async (req, res) => {
     }
 
     const phoneDigits = phone.replace(/\D/g, '');
+
+    if (!checkOtpRateLimit(`whatsapp:${phoneDigits}`)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    }
     const code = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
@@ -1215,9 +1252,13 @@ router.post('/verify-otp', async (req, res) => {
     const { identifier, code } = req.body;
     if (!identifier || !code) return res.status(400).json({ error: 'identifier e code são obrigatórios' });
 
+    // Sanitize: trim whitespace from code, normalize identifier
+    const cleanCode = String(code).trim();
+    const cleanIdentifier = String(identifier).trim().toLowerCase();
+
     const result = await pool.query(
       'SELECT * FROM otp_codes WHERE identifier = $1 ORDER BY created_at DESC LIMIT 1',
-      [identifier]
+      [cleanIdentifier]
     );
 
     if (result.rows.length === 0) return res.status(400).json({ error: 'Código não encontrado' });
@@ -1226,9 +1267,9 @@ router.post('/verify-otp', async (req, res) => {
 
     if (otp.verified) return res.status(400).json({ error: 'Código já utilizado' });
     if (new Date() > new Date(otp.expires_at)) return res.status(400).json({ error: 'Código expirado' });
-    if (otp.code !== code) return res.status(400).json({ error: 'Código inválido' });
+    if (otp.code !== cleanCode) return res.status(400).json({ error: 'Código inválido' });
 
-    await pool.query('UPDATE otp_codes SET verified = true WHERE identifier = $1', [identifier]);
+    await pool.query('UPDATE otp_codes SET verified = true WHERE identifier = $1', [cleanIdentifier]);
 
     return res.json({ success: true, verified: true });
   } catch (err) {

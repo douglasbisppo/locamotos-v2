@@ -3,7 +3,6 @@ import WhatsAppIcon from '@/components/WhatsAppIcon';
 import { Button } from '@/components/ui/button';
 import { Link } from 'react-router-dom';
 import { useState } from 'react';
-import motoHero from '@/assets/moto-hero-v2.png';
 import hondaCg160 from '@/assets/honda-cg-160-fan.png';
 
 const faqs = [
@@ -16,7 +15,7 @@ const faqs = [
   { q: 'Preciso me preocupar com documentação?', a: 'Não! Toda a documentação e burocracia é feita pela 021 Loca Motos, você só precisa trabalhar.' },
 ];
 
-const FaqItem = ({ q, a, index }: { q: string; a: string; index: number }) => {
+const FaqItem = ({ q, a }: { q: string; a: string }) => {
   const [open, setOpen] = useState(false);
   return (
     <div className="border border-[hsl(222,30%,20%)] rounded-xl overflow-hidden mb-3">
@@ -322,7 +321,7 @@ const LandingPreview = () => {
               </h2>
             </div>
             {faqs.map((faq, i) => (
-              <FaqItem key={faq.q} q={faq.q} a={faq.a} index={i} />
+              <FaqItem key={faq.q} q={faq.q} a={faq.a} />
             ))}
           </div>
         </div>

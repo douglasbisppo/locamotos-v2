@@ -9,8 +9,8 @@ const SOFTRUCK_TRACKING_URL = 'https://api.tracking.softruck.com/responsibles';
 const SOFTRUCK_VEHICLES_URL = 'https://api.app.softruck.com/api/v5/vehicles';
 const SOFTRUCK_DEVICES_URL = 'https://api.app.softruck.com/api/v5/devices';
 
-const SOFTRUCK_USERNAME = process.env.SOFTRUCK_USERNAME || '09359130761';
-const SOFTRUCK_PASSWORD = process.env.SOFTRUCK_PASSWORD || '123456789';
+const SOFTRUCK_USERNAME = process.env.SOFTRUCK_USERNAME;
+const SOFTRUCK_PASSWORD = process.env.SOFTRUCK_PASSWORD;
 const SOFTRUCK_RESPONSIBLE_ID = '5paxZxnkx9LWbP3';
 
 // Token cache
@@ -21,6 +21,10 @@ let tokenExpiry = 0;
 async function getSoftruckToken() {
   if (cachedToken && Date.now() < tokenExpiry) {
     return cachedToken;
+  }
+
+  if (!SOFTRUCK_USERNAME || !SOFTRUCK_PASSWORD) {
+    throw new Error('SOFTRUCK_USERNAME e SOFTRUCK_PASSWORD não configurados no .env');
   }
 
   const res = await fetch(SOFTRUCK_AUTH_URL, {
@@ -51,13 +55,14 @@ async function getSoftruckToken() {
 // ─── Auth middleware (reuse from main app) ────────────────────────────────────
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
-const JWT_SECRET = process.env.JWT_SECRET || 'locamotos-secret-key-change-me';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) console.warn('[TRACKING] JWT_SECRET não configurado no .env');
 
 const pool = new Pool({
   host: process.env.PG_HOST || 'localhost',
   port: parseInt(process.env.PG_PORT || '5432'),
-  user: process.env.PG_USER || 'linkr',
-  password: process.env.PG_PASSWORD || 'troque-por-senha-segura',
+  user: process.env.PG_USER,
+  password: process.env.PG_PASSWORD,
   database: process.env.PG_DATABASE || 'locamotos',
 });
 
@@ -78,7 +83,7 @@ function requireAuth(req, res, next) {
 
 async function requireAdmin(req, res, next) {
   try {
-    const userId = req.user?.sub;
+    const userId = req.user?.sub || req.user?.id;
     if (!userId) return res.status(403).json({ error: 'Acesso restrito' });
     const { rows } = await pool.query(
       'SELECT role FROM user_roles WHERE user_id = $1', [userId]
@@ -271,6 +276,13 @@ function formatTimeAgo(date) {
 // ─── POST /api/tracking/odometer-poll ─────────────────────────────────────────
 // Called by cron every 2 minutes to save odometer data for vehicles with ignition ON
 router.post('/odometer-poll', async (req, res) => {
+  // Protect cron endpoint with API key
+  const cronKey = req.headers['x-cron-key'] || req.query.key;
+  const expectedKey = process.env.CRON_API_KEY;
+  if (expectedKey && cronKey !== expectedKey) {
+    return res.status(403).json({ error: 'Acesso não autorizado' });
+  }
+
   try {
     const token = await getSoftruckToken();
     const vtypes = encodeURIComponent(JSON.stringify(["CAR","MOTORCYCLE","TRUCK/BUS","OTHER",null]));
