@@ -387,7 +387,7 @@ router.post('/odometer-poll', async (req, res) => {
 
 // ─── GET /api/tracking/odometer ───────────────────────────────────────────────
 // Returns current odometer totals for all vehicles
-router.get('/odometer', requireAuth, async (req, res) => {
+router.get('/odometer', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT vt.plate, (vt.total_km + COALESCE(vt.odometer_offset, 0)) as total_km, vt.total_km as calculated_km, COALESCE(vt.odometer_offset, 0) as odometer_offset, vt.last_lat, vt.last_lng, vt.last_recorded_at,
@@ -405,10 +405,10 @@ router.get('/odometer', requireAuth, async (req, res) => {
 
 // ─── GET /api/tracking/odometer-history/:plate ────────────────────────────────
 // Returns odometer history for a specific vehicle
-router.get('/odometer-history/:plate', requireAuth, async (req, res) => {
+router.get('/odometer-history/:plate', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { plate } = req.params;
-    const days = parseInt(req.query.days) || 30;
+    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
 
     // Daily summary
     const { rows: daily } = await pool.query(
@@ -460,11 +460,15 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
 
 // ─── PATCH /api/tracking/odometer-offset ──────────────────────────────────────
 // Set the initial odometer offset for a vehicle
-router.patch('/odometer-offset', requireAuth, async (req, res) => {
+router.patch('/odometer-offset', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { plate, offset } = req.body;
     if (!plate || offset === undefined) {
       return res.status(400).json({ error: 'plate and offset required' });
+    }
+    const numericOffset = parseFloat(offset);
+    if (isNaN(numericOffset) || numericOffset < 0 || numericOffset > 999999) {
+      return res.status(400).json({ error: 'offset deve ser um número entre 0 e 999999' });
     }
 
     const { rows } = await pool.query(
@@ -477,12 +481,12 @@ router.patch('/odometer-offset', requireAuth, async (req, res) => {
       await pool.query(
         `INSERT INTO vehicle_odometer_total (plate, total_km, odometer_offset, last_lat, last_lng, last_recorded_at)
          VALUES ($1, 0, $2, 0, 0, NOW())`,
-        [plate, offset]
+        [plate, numericOffset]
       );
     } else {
       await pool.query(
         'UPDATE vehicle_odometer_total SET odometer_offset = $1 WHERE plate = $2',
-        [offset, plate]
+        [numericOffset, plate]
       );
     }
 
@@ -497,15 +501,15 @@ router.patch('/odometer-offset', requireAuth, async (req, res) => {
       [
         'odometer_adjustment',
         'Ajuste de Odometro',
-        `KM inicial ajustado para ${offset} km (anterior: ${previousOffset} km)`,
+        `KM inicial ajustado para ${numericOffset} km (anterior: ${previousOffset} km)`,
         plate,
         userName,
         userId,
-        JSON.stringify({ plate, new_offset: offset, previous_offset: previousOffset })
+        JSON.stringify({ plate, new_offset: numericOffset, previous_offset: previousOffset })
       ]
     );
 
-    res.json({ success: true, plate, offset });
+    res.json({ success: true, plate, offset: numericOffset });
   } catch (err) {
     console.error('Odometer offset error:', err);
     res.status(500).json({ error: err.message });
@@ -516,10 +520,10 @@ router.patch('/odometer-offset', requireAuth, async (req, res) => {
 
 // ─── GET /api/tracking/alerts ─────────────────────────────────────────────────
 // Returns system alerts for admin dashboard
-router.get('/alerts', requireAuth, async (req, res) => {
+router.get('/alerts', requireAuth, requireAdmin, async (req, res) => {
   try {
     const unreadOnly = req.query.unread === 'true';
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     
     let query = 'SELECT * FROM system_alerts';
     const params = [];
@@ -551,7 +555,7 @@ router.get('/alerts', requireAuth, async (req, res) => {
 
 // ─── PATCH /api/tracking/alerts/:id/read ──────────────────────────────────────
 // Mark an alert as read
-router.patch('/alerts/:id/read', requireAuth, async (req, res) => {
+router.patch('/alerts/:id/read', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('UPDATE system_alerts SET is_read = true WHERE id = $1', [id]);
@@ -563,7 +567,7 @@ router.patch('/alerts/:id/read', requireAuth, async (req, res) => {
 
 // ─── PATCH /api/tracking/alerts/read-all ──────────────────────────────────────
 // Mark all alerts as read
-router.patch('/alerts/read-all', requireAuth, async (req, res) => {
+router.patch('/alerts/read-all', requireAuth, requireAdmin, async (req, res) => {
   try {
     await pool.query('UPDATE system_alerts SET is_read = true WHERE is_read = false');
     res.json({ success: true });

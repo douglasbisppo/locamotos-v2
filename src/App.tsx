@@ -57,7 +57,11 @@ const App = () => (
                 <WhatsAppConnect />
               </ProtectedRoute>
             } />
-            <Route path="/preview-docs" element={<PreviewDocuments />} />
+            <Route path="/preview-docs" element={
+              <ProtectedRoute requireAdmin>
+                <PreviewDocuments />
+              </ProtectedRoute>
+            } />
             <Route path="/termos-de-uso" element={<TermsOfUse />} />
             <Route path="/politica-de-privacidade" element={<PrivacyPolicy />} />
             <Route path="*" element={<NotFound />} />

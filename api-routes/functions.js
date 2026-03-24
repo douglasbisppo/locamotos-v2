@@ -9,6 +9,17 @@ const bcrypt = require('bcryptjs');
 const pool = require('../db');
 const { authenticate, requireAuth, requireAdmin } = require('../middleware/auth');
 
+// ─── Helper: Get local date in Brasília timezone (UTC-3) ──────────────────────
+function getLocalDateBR() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }); // returns YYYY-MM-DD
+}
+
+// ─── Helper: Sanitize string input (prevent XSS/injection in logs/messages) ────
+function sanitize(str, maxLen = 500) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/<[^>]*>/g, '').trim().slice(0, maxLen);
+}
+
 const router = express.Router();
 router.use(authenticate);
 
@@ -279,14 +290,15 @@ router.post('/mercadopago-webhook', async (req, res) => {
         );
         const contract = contractResult.rows[0];
 
-        const today = new Date();
-        const vencimento = new Date(today);
+        const todayBR = getLocalDateBR();
+        const vencimento = new Date(todayBR + 'T12:00:00');
         vencimento.setDate(vencimento.getDate() + 7);
+        const vencimentoStr = vencimento.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
 
         await pool.query(
           `INSERT INTO pagamentos_semanais (contract_id, numero_semana, valor_base, valor_total, data_vencimento, data_pagamento, status, created_at)
            VALUES ($1, 1, $2, $2, $3, $4, 'pago', NOW())`,
-          [contract.id, refData.valorSemanal, vencimento.toISOString().split('T')[0], today.toISOString().split('T')[0]]
+          [contract.id, refData.valorSemanal, vencimentoStr, todayBR]
         );
 
         // Trigger clicksign envelope creation (non-blocking, internal call)
@@ -532,8 +544,8 @@ router.post('/clicksign-create-envelope', requireAuth, async (req, res) => {
     ].filter(Boolean).join(', ');
 
     const dataInicio = contract.data_inicio
-      ? (contract.data_inicio instanceof Date ? contract.data_inicio.toISOString().split('T')[0] : contract.data_inicio.toString().split('T')[0])
-      : new Date().toISOString().split('T')[0];
+      ? (contract.data_inicio instanceof Date ? contract.data_inicio.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }) : contract.data_inicio.toString().split('T')[0])
+      : getLocalDateBR();
 
     const contractData = {
       contractId: contract.id,
@@ -770,6 +782,9 @@ router.post('/whatsapp', requireAuth, async (req, res) => {
 
     if (action === 'send-message') {
       if (!number || !message) return res.status(400).json({ error: 'Número e mensagem são obrigatórios' });
+      if (typeof message !== 'string' || message.length > 4096) {
+        return res.status(400).json({ error: 'Mensagem inválida ou muito longa (máx 4096 caracteres)' });
+      }
       const clean = number.replace(/\D/g, '');
       const cleanNumber = clean.startsWith('55') ? clean : '55' + clean;
       const r = await fetch(`${baseUrl}/message/sendText/${inst}`, {
@@ -1007,6 +1022,9 @@ router.post("/whatsapp-bot", async (req, res) => {
 
     if (!incomingText) return res.json({ ok: true, no_text: true });
 
+    // Sanitize incoming text to prevent injection in logs/messages (max 1000 chars)
+    const safeText = sanitize(incomingText, 1000);
+
     const rawJid = messageData.key?.remoteJidAlt || messageData.key?.remoteJid || "";
     const instanceName = body.instance || "motogest";
     const isGroup = rawJid.includes("@g.us");
@@ -1021,7 +1039,7 @@ router.post("/whatsapp-bot", async (req, res) => {
         const hashMatch = incomingText.match(/^#(\d{10,15})\s+(.+)$/s);
         if (hashMatch) {
           const clientPhone = hashMatch[1];
-          const replyText = hashMatch[2].trim();
+          const replyText = sanitize(hashMatch[2].trim(), 2000);
           if (replyText === "#encerrar") {
             await pool.query(
               "UPDATE atendimentos SET status = 'encerrado', closed_at = NOW() WHERE cliente_phone = $1 AND status = 'em_atendimento'",
@@ -1072,7 +1090,7 @@ router.post("/whatsapp-bot", async (req, res) => {
         return res.json({ ok: true, session_closed: true });
       } else if (groupJid) {
         const clientName = session.cliente_name || senderNumber;
-        const forwardMsg = `*Mensagem de ${clientName}* (${senderNumber}):\n\n${incomingText}\n\n_Responda: #${senderNumber} sua mensagem_\n_Para encerrar: #${senderNumber} #encerrar_`;
+        const forwardMsg = `*Mensagem de ${sanitize(clientName, 100)}* (${senderNumber}):\n\n${safeText}\n\n_Responda: #${senderNumber} sua mensagem_\n_Para encerrar: #${senderNumber} #encerrar_`;
         await sendText(instanceName, groupJid, forwardMsg);
         return res.json({ ok: true, forwarded: true });
       }
@@ -1101,7 +1119,7 @@ router.post("/whatsapp-bot", async (req, res) => {
         const groupSettingResult = await pool.query("SELECT value FROM bot_settings WHERE key = 'support_group_jid'");
         const groupJid = groupSettingResult.rows[0]?.value;
         if (groupJid) {
-          const clientName = messageData.pushName || senderNumber;
+          const clientName = sanitize(messageData.pushName || senderNumber, 100);
           await pool.query(
             "INSERT INTO atendimentos (cliente_phone, cliente_name, status, created_at) VALUES ($1, $2, $3, NOW())",
             [senderNumber, clientName, "aguardando"]
@@ -1279,9 +1297,12 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 // ─── POST /api/functions/notify-admin-new-user ───────────────────────────────
-router.post('/notify-admin-new-user', async (req, res) => {
+router.post('/notify-admin-new-user', requireAuth, async (req, res) => {
   try {
-    const { userName, userEmail } = req.body;
+    const { userName: rawName, userEmail: rawEmail } = req.body;
+    // Sanitize to prevent XSS in email HTML
+    const userName = sanitize(rawName, 200);
+    const userEmail = sanitize(rawEmail, 200);
 
     const RESEND_API_KEY = process.env.RESEND_API_KEY;
     if (!RESEND_API_KEY) return res.status(500).json({ error: 'RESEND_API_KEY not configured' });
@@ -1318,7 +1339,7 @@ router.post('/notify-admin-new-user', async (req, res) => {
 });
 
 // ─── POST /api/functions/send-welcome-email ───────────────────────────────────
-router.post('/send-welcome-email', async (req, res) => {
+router.post('/send-welcome-email', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
@@ -1335,13 +1356,14 @@ router.post('/send-welcome-email', async (req, res) => {
 
     const { email, display_name } = userResult.rows[0];
     if (!email) return res.status(400).json({ error: 'Usuário sem email' });
+    const safeName = sanitize(display_name || 'Cliente', 200);
 
     await sendResendEmail(email, '✅ Cadastro Aprovado - 021 Loca Motos', `
       <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;">
         <h1 style="color:#1a1f36;text-align:center;">🏍️ 021 Loca Motos</h1>
         <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:32px;text-align:center;">
           <div style="font-size:48px;margin-bottom:16px;">🎉</div>
-          <h2 style="color:#166534;">Bem-vindo(a), ${display_name || 'Cliente'}!</h2>
+          <h2 style="color:#166534;">Bem-vindo(a), ${safeName}!</h2>
           <p style="color:#555;font-size:16px;line-height:1.5;">
             Seu cadastro foi <strong>aprovado</strong> pelo nosso time! Agora você pode acessar a plataforma.
           </p>
