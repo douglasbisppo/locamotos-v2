@@ -11,7 +11,14 @@ const SOFTRUCK_DEVICES_URL = 'https://api.app.softruck.com/api/v5/devices';
 
 const SOFTRUCK_USERNAME = process.env.SOFTRUCK_USERNAME;
 const SOFTRUCK_PASSWORD = process.env.SOFTRUCK_PASSWORD;
-const SOFTRUCK_RESPONSIBLE_ID = '5paxZxnkx9LWbP3';
+const SOFTRUCK_RESPONSIBLE_ID = process.env.SOFTRUCK_RESPONSIBLE_ID;
+
+if (!SOFTRUCK_USERNAME || !SOFTRUCK_PASSWORD) {
+  console.error('[TRACKING] SOFTRUCK_USERNAME e SOFTRUCK_PASSWORD são obrigatórios no .env');
+}
+if (!SOFTRUCK_RESPONSIBLE_ID) {
+  console.error('[TRACKING] SOFTRUCK_RESPONSIBLE_ID é obrigatório no .env');
+}
 
 // Token cache
 let cachedToken = null;
@@ -52,52 +59,16 @@ async function getSoftruckToken() {
   return cachedToken;
 }
 
-// ─── Auth middleware (reuse from main app) ────────────────────────────────────
-const jwt = require('jsonwebtoken');
-const { Pool } = require('pg');
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) console.warn('[TRACKING] JWT_SECRET não configurado no .env');
+// ─── Auth middleware & DB pool (shared from main app) ─────────────────────────
+const pool = require('../db');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { corsMiddleware, securityHeaders } = require('../middleware/security');
+const { globalLimiter } = require('../middleware/rate-limit');
 
-const pool = new Pool({
-  host: process.env.PG_HOST || 'localhost',
-  port: parseInt(process.env.PG_PORT || '5432'),
-  user: process.env.PG_USER,
-  password: process.env.PG_PASSWORD,
-  database: process.env.PG_DATABASE || 'locamotos',
-});
-
-function requireAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token não fornecido' });
-  }
-  try {
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Token inválido' });
-  }
-}
-
-async function requireAdmin(req, res, next) {
-  try {
-    const userId = req.user?.sub || req.user?.id;
-    if (!userId) return res.status(403).json({ error: 'Acesso restrito' });
-    const { rows } = await pool.query(
-      'SELECT role FROM user_roles WHERE user_id = $1', [userId]
-    );
-    if (!rows.length || rows[0].role !== 'admin') {
-      return res.status(403).json({ error: 'Acesso restrito a administradores' });
-    }
-    req.user.role = 'admin';
-    next();
-  } catch (err) {
-    console.error('Admin check error:', err);
-    return res.status(500).json({ error: 'Erro ao verificar permissões' });
-  }
-}
+// Apply security middleware
+router.use(securityHeaders);
+router.use(corsMiddleware);
+router.use(globalLimiter);
 
 // ─── GET /api/tracking/positions ──────────────────────────────────────────────
 // Returns all vehicle positions from Softruck tracking API
@@ -187,7 +158,7 @@ router.get('/positions', requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error('Tracking positions error:', err);
-    res.status(500).json({ error: err.message || 'Erro ao buscar posições' });
+    res.status(500).json({ error: 'Erro ao buscar posições' });
   }
 });
 
@@ -219,7 +190,7 @@ router.get('/vehicles', requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error('Tracking vehicles error:', err);
-    res.status(500).json({ error: err.message || 'Erro ao buscar veículos' });
+    res.status(500).json({ error: 'Erro ao buscar veículos' });
   }
 });
 
@@ -251,7 +222,7 @@ router.get('/devices', requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error('Tracking devices error:', err);
-    res.status(500).json({ error: err.message || 'Erro ao buscar dispositivos' });
+    res.status(500).json({ error: 'Erro ao buscar dispositivos' });
   }
 });
 
@@ -276,10 +247,10 @@ function formatTimeAgo(date) {
 // ─── POST /api/tracking/odometer-poll ─────────────────────────────────────────
 // Called by cron every 2 minutes to save odometer data for vehicles with ignition ON
 router.post('/odometer-poll', async (req, res) => {
-  // Protect cron endpoint with API key
-  const cronKey = req.headers['x-cron-key'] || req.query.key;
+  // Protect cron endpoint with API key (mandatory, header only)
+  const cronKey = req.headers['x-cron-key'];
   const expectedKey = process.env.CRON_API_KEY;
-  if (expectedKey && cronKey !== expectedKey) {
+  if (!expectedKey || cronKey !== expectedKey) {
     return res.status(403).json({ error: 'Acesso não autorizado' });
   }
 
@@ -381,7 +352,7 @@ router.post('/odometer-poll', async (req, res) => {
     res.json({ success: true, saved, skipped, total: features.length });
   } catch (err) {
     console.error('Odometer poll error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro ao processar odômetro' });
   }
 });
 
@@ -399,7 +370,7 @@ router.get('/odometer', requireAuth, requireAdmin, async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('Odometer totals error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -440,7 +411,7 @@ router.get('/odometer-history/:plate', requireAuth, requireAdmin, async (req, re
     });
   } catch (err) {
     console.error('Odometer history error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -512,7 +483,7 @@ router.patch('/odometer-offset', requireAuth, requireAdmin, async (req, res) => 
     res.json({ success: true, plate, offset: numericOffset });
   } catch (err) {
     console.error('Odometer offset error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -549,7 +520,7 @@ router.get('/alerts', requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error('Alerts fetch error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -561,7 +532,7 @@ router.patch('/alerts/:id/read', requireAuth, requireAdmin, async (req, res) => 
     await pool.query('UPDATE system_alerts SET is_read = true WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -572,7 +543,7 @@ router.patch('/alerts/read-all', requireAuth, requireAdmin, async (req, res) => 
     await pool.query('UPDATE system_alerts SET is_read = true WHERE is_read = false');
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
