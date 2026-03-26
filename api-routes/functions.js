@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const pool = require('../db');
 const { authenticate, requireAuth, requireAdmin } = require('../middleware/auth');
+const { corsMiddleware, securityHeaders } = require('../middleware/security');
+const { globalLimiter, authLimiter } = require('../middleware/rate-limit');
 
 // ─── Helper: Get local date in Brasília timezone (UTC-3) ──────────────────────
 function getLocalDateBR() {
@@ -21,12 +23,15 @@ function sanitize(str, maxLen = 500) {
 }
 
 const router = express.Router();
+router.use(securityHeaders);
+router.use(corsMiddleware);
+router.use(globalLimiter);
 router.use(authenticate);
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
 
 function generateOTP() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 999999));
 }
 
 async function sendResendEmail(to, subject, html) {
@@ -63,6 +68,20 @@ router.post('/create-admin', requireAuth, requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Email e senha são obrigatórios' });
     }
 
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Formato de email inválido' });
+    }
+
+    // Validate password: min 8 chars, at least 1 uppercase, 1 lowercase, 1 number
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Senha deve ter no mínimo 8 caracteres' });
+    }
+    if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) {
+      return res.status(400).json({ error: 'Senha deve conter pelo menos uma letra maiúscula, uma minúscula e um número' });
+    }
+
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: 'Email já cadastrado' });
@@ -97,7 +116,7 @@ router.post('/create-admin', requireAuth, requireAdmin, async (req, res) => {
     return res.json({ success: true, user_id: userId });
   } catch (err) {
     console.error('create-admin error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -121,6 +140,18 @@ router.post('/create-checkout', requireAuth, async (req, res) => {
 
     if (!motoId || !planoMeses) {
       return res.status(400).json({ error: 'motoId e planoMeses são obrigatórios' });
+    }
+
+    // Validate numeric types
+    const valorCartaoNum = Number(valorCartao);
+    const valorPixNum = Number(valorPix);
+    const parcelamentoNum = Number(parcelamentoAssinatura);
+    const parcelasNum = Number(parcelasAssinatura);
+    if (isNaN(valorCartaoNum) || isNaN(valorPixNum) || isNaN(parcelamentoNum) || isNaN(parcelasNum)) {
+      return res.status(400).json({ error: 'Valores devem ser numéricos' });
+    }
+    if (valorCartaoNum < 0 || valorPixNum < 0 || parcelamentoNum < 0 || parcelasNum < 0) {
+      return res.status(400).json({ error: 'Valores não podem ser negativos' });
     }
 
     const planos = { 36: 450, 30: 500, 24: 550 };
@@ -223,7 +254,7 @@ router.post('/create-checkout', requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('create-checkout error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -236,28 +267,36 @@ router.post('/mercadopago-webhook', async (req, res) => {
     }
 
     const WEBHOOK_SECRET = process.env.MERCADO_PAGO_WEBHOOK_SECRET;
+    if (!WEBHOOK_SECRET) {
+      console.error('MERCADO_PAGO_WEBHOOK_SECRET not configured');
+      return res.status(500).send('Webhook secret not configured');
+    }
 
-        const body = req.body;
+    const body = req.body;
 
-    // Validate webhook signature if secret configured
+    // Validate webhook signature (mandatory)
     const xSignature = req.headers['x-signature'];
     const xRequestId = req.headers['x-request-id'];
 
-    if (WEBHOOK_SECRET && xSignature && xRequestId) {
-      const parts = xSignature.split(',');
-      const tsValue = parts.find(p => p.trim().startsWith('ts='))?.split('=')[1];
-      const v1Value = parts.find(p => p.trim().startsWith('v1='))?.split('=')[1];
+    if (!xSignature || !xRequestId) {
+      return res.status(401).send('Missing signature headers');
+    }
 
-      if (tsValue && v1Value) {
-        const dataId = body.data?.id;
-        const manifest = `id:${dataId};request-id:${xRequestId};ts:${tsValue};`;
-        const computedHash = crypto.createHmac('sha256', WEBHOOK_SECRET).update(manifest).digest('hex');
+    const parts = xSignature.split(',');
+    const tsValue = parts.find(p => p.trim().startsWith('ts='))?.split('=')[1];
+    const v1Value = parts.find(p => p.trim().startsWith('v1='))?.split('=')[1];
 
-        if (computedHash !== v1Value) {
-          console.error('Invalid webhook signature');
-          return res.status(401).send('Unauthorized');
-        }
-      }
+    if (!tsValue || !v1Value) {
+      return res.status(401).send('Invalid signature format');
+    }
+
+    const dataId = body.data?.id;
+    const manifest = `id:${dataId};request-id:${xRequestId};ts:${tsValue};`;
+    const computedHash = crypto.createHmac('sha256', WEBHOOK_SECRET).update(manifest).digest('hex');
+
+    if (computedHash !== v1Value) {
+      console.error('Invalid webhook signature');
+      return res.status(401).send('Unauthorized');
     }
 
     if (body.type === 'payment' || body.action === 'payment.created' || body.action === 'payment.updated') {
@@ -350,6 +389,17 @@ async function clicksignRequest(path, method, body) {
   return JSON.parse(text);
 }
 
+// ─── Helper: Escape HTML to prevent XSS in generated documents ──────────────
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function textToBase64(text) {
   return Buffer.from(text, 'utf-8').toString('base64');
 }
@@ -413,19 +463,19 @@ h2 { font-size: 14px; margin-top: 20px; border-bottom: 1px solid #ccc; padding-b
 </head>
 <body>
 <h1>CONTRATO DE LOCAÇÃO DE MOTOCICLETA<br>COM OPÇÃO DE TRANSFERÊNCIA</h1>
-<p style="text-align:center">Contrato nº ${data.motoPlaca.toUpperCase()}</p>
+<p style="text-align:center">Contrato nº ${escapeHtml(data.motoPlaca.toUpperCase())}</p>
 
 <h2>1. PARTES</h2>
 <p><strong>LOCADORA:</strong> Zero Vinte Um Loca Motos LTDA — CNPJ: 31.831.358/0001-90</p>
-<p><strong>LOCATÁRIO:</strong> ${data.clientName} — CPF: ${data.clientCpf} — CNH: ${data.clientCnh || 'N/A'}</p>
-<p><strong>Endereço:</strong> ${data.clientAddress}</p>
+<p><strong>LOCATÁRIO:</strong> ${escapeHtml(data.clientName)} — CPF: ${escapeHtml(data.clientCpf)} — CNH: ${escapeHtml(data.clientCnh || 'N/A')}</p>
+<p><strong>Endereço:</strong> ${escapeHtml(data.clientAddress)}</p>
 
 <h2>2. OBJETO</h2>
 <table class="info-table">
-<tr><td class="label">Modelo</td><td>${data.motoModelo}</td></tr>
-<tr><td class="label">Placa</td><td>${data.motoPlaca}</td></tr>
-<tr><td class="label">Chassi</td><td>${data.motoChassi || 'N/A'}</td></tr>
-<tr><td class="label">Cor</td><td>${data.motoCor || 'N/A'}</td></tr>
+<tr><td class="label">Modelo</td><td>${escapeHtml(data.motoModelo)}</td></tr>
+<tr><td class="label">Placa</td><td>${escapeHtml(data.motoPlaca)}</td></tr>
+<tr><td class="label">Chassi</td><td>${escapeHtml(data.motoChassi || 'N/A')}</td></tr>
+<tr><td class="label">Cor</td><td>${escapeHtml(data.motoCor || 'N/A')}</td></tr>
 </table>
 
 <h2>3. PRAZO E VALORES</h2>
@@ -456,7 +506,7 @@ h2 { font-size: 14px; margin-top: 20px; border-bottom: 1px solid #ccc; padding-b
 <div class="signature-line"></div>
 <p><strong>Zero Vinte Um Loca Motos LTDA</strong><br>CNPJ: 31.831.358/0001-90</p>
 <div class="signature-line"></div>
-<p><strong>${data.clientName}</strong><br>CPF: ${data.clientCpf}</p>
+<p><strong>${escapeHtml(data.clientName)}</strong><br>CPF: ${escapeHtml(data.clientCpf)}</p>
 </div>
 </body></html>`;
 }
@@ -480,8 +530,8 @@ th { background: #f5f5f5; }
 </style></head>
 <body>
 <h1>CHECKLIST DE RETIRADA DE MOTOCICLETA</h1>
-<p><strong>Data:</strong> ${formattedDate} | <strong>Locatário:</strong> ${data.clientName} | <strong>CPF:</strong> ${data.clientCpf}</p>
-<p><strong>Modelo:</strong> ${data.motoModelo} | <strong>Placa:</strong> ${data.motoPlaca} | <strong>Cor:</strong> ${data.motoCor || 'N/A'}</p>
+<p><strong>Data:</strong> ${formattedDate} | <strong>Locatário:</strong> ${escapeHtml(data.clientName)} | <strong>CPF:</strong> ${escapeHtml(data.clientCpf)}</p>
+<p><strong>Modelo:</strong> ${escapeHtml(data.motoModelo)} | <strong>Placa:</strong> ${escapeHtml(data.motoPlaca)} | <strong>Cor:</strong> ${escapeHtml(data.motoCor || 'N/A')}</p>
 <table>
 <tr><th>Item</th><th>OK</th><th>Avaria</th><th>Observação</th></tr>
 ${rows}
@@ -489,7 +539,7 @@ ${rows}
 <p><strong>Observações gerais:</strong></p>
 <div style="border:1px solid #ccc;min-height:60px;padding:8px;"></div>
 <div class="signature-area">
-<div class="signature-line"></div><p><strong>${data.clientName}</strong><br>LOCATÁRIO</p>
+<div class="signature-line"></div><p><strong>${escapeHtml(data.clientName)}</strong><br>LOCATÁRIO</p>
 <div class="signature-line"></div><p><strong>Zero Vinte Um Loca Motos LTDA</strong><br>RESPONSÁVEL</p>
 </div>
 </body></html>`;
@@ -521,6 +571,12 @@ router.post('/clicksign-create-envelope', requireAuth, async (req, res) => {
   try {
     const { contractId } = req.body;
     if (!contractId) return res.status(400).json({ error: 'contractId é obrigatório' });
+
+    // Validate contractId format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (typeof contractId !== 'string' && typeof contractId !== 'number') {
+      return res.status(400).json({ error: 'contractId inválido' });
+    }
 
     const contractResult = await pool.query('SELECT * FROM contracts WHERE id = $1', [contractId]);
     if (contractResult.rows.length === 0) throw new Error('Contrato não encontrado');
@@ -648,7 +704,7 @@ router.post('/clicksign-create-envelope', requireAuth, async (req, res) => {
     return res.json({ success: true, envelopeId });
   } catch (err) {
     console.error('clicksign-create-envelope error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -669,13 +725,34 @@ router.post('/clicksign-cancel-envelope', requireAuth, async (req, res) => {
     return res.json({ success: true, message: 'Envelope cancelado' });
   } catch (err) {
     console.error('clicksign-cancel-envelope error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
 // ─── POST /api/functions/clicksign-webhook ───────────────────────────────────
 router.post('/clicksign-webhook', async (req, res) => {
   try {
+    // Validate Clicksign webhook signature (HMAC-SHA256)
+    const CLICKSIGN_WEBHOOK_SECRET = process.env.CLICKSIGN_WEBHOOK_SECRET;
+    if (!CLICKSIGN_WEBHOOK_SECRET) {
+      console.error('CLICKSIGN_WEBHOOK_SECRET not configured');
+      return res.status(500).send('Webhook secret not configured');
+    }
+
+    const signature = req.headers['content-hmac'] || req.headers['x-clicksign-signature'];
+    if (!signature) {
+      return res.status(401).send('Missing signature');
+    }
+
+    const computedHmac = crypto.createHmac('sha256', CLICKSIGN_WEBHOOK_SECRET)
+      .update(JSON.stringify(req.body)).digest('hex');
+
+    const sigBuffer = Buffer.from(signature.replace(/^sha256=/, ''));
+    const computedBuffer = Buffer.from(computedHmac);
+    if (sigBuffer.length !== computedBuffer.length || !crypto.timingSafeEqual(sigBuffer, computedBuffer)) {
+      return res.status(401).send('Invalid signature');
+    }
+
     const body = req.body;
     const eventName = body?.event?.name || body?.event;
     const relevantEvents = ['auto_close', 'close', 'document_closed'];
@@ -730,7 +807,7 @@ router.post('/clicksign-webhook', async (req, res) => {
     return res.json({ ok: true, message: 'Processed' });
   } catch (err) {
     console.error('clicksign-webhook error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -836,7 +913,7 @@ router.post('/whatsapp', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Ação inválida' });
   } catch (err) {
     console.error('whatsapp error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -1146,7 +1223,7 @@ router.post("/whatsapp-bot", async (req, res) => {
     return res.json({ ok: true, responded: true });
   } catch (err) {
     console.error("whatsapp-bot error:", err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -1176,7 +1253,7 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 // ─── POST /api/functions/send-email-otp ──────────────────────────────────────
-router.post('/send-email-otp', async (req, res) => {
+router.post('/send-email-otp', authLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1187,7 +1264,7 @@ router.post('/send-email-otp', async (req, res) => {
     }
 
     const code = generateOTP();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     await pool.query(
       `INSERT INTO otp_codes (identifier, code, expires_at, verified, created_at)
@@ -1204,7 +1281,7 @@ router.post('/send-email-otp', async (req, res) => {
           <div style="background:#1a1f36;color:#f5a623;font-size:32px;font-weight:bold;letter-spacing:8px;padding:16px 24px;border-radius:8px;display:inline-block;">
             ${code}
           </div>
-          <p style="color:#888;font-size:13px;margin-top:20px;">Não compartilhe. Expira em 10 minutos.</p>
+          <p style="color:#888;font-size:13px;margin-top:20px;">Não compartilhe. Expira em 5 minutos.</p>
         </div>
       </div>
     `);
@@ -1212,25 +1289,27 @@ router.post('/send-email-otp', async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('send-email-otp error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
 // ─── POST /api/functions/generate-whatsapp-otp ───────────────────────────────
-router.post('/generate-whatsapp-otp', async (req, res) => {
+router.post('/generate-whatsapp-otp', authLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
-    if (!phone || phone.replace(/\D/g, '').length < 10) {
-      return res.status(400).json({ error: 'Número de telefone inválido' });
+    if (!phone) {
+      return res.status(400).json({ error: 'Número de telefone é obrigatório' });
     }
-
     const phoneDigits = phone.replace(/\D/g, '');
+    if (phoneDigits.length < 10 || phoneDigits.length > 13) {
+      return res.status(400).json({ error: 'Número de telefone inválido (10-13 dígitos)' });
+    }
 
     if (!checkOtpRateLimit(`whatsapp:${phoneDigits}`)) {
       return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
     }
     const code = generateOTP();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     await pool.query(
       `INSERT INTO otp_codes (identifier, code, expires_at, verified, created_at)
@@ -1251,7 +1330,7 @@ router.post('/generate-whatsapp-otp', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
       body: JSON.stringify({
         number: cleanNumber,
-        text: `🔐 021 Loca Motos - Seu código de verificação é: *${code}*\n\nNão compartilhe este código. Ele expira em 10 minutos.`,
+        text: `🔐 021 Loca Motos - Seu código de verificação é: *${code}*\n\nNão compartilhe este código. Ele expira em 5 minutos.`,
       }),
     });
 
@@ -1260,12 +1339,12 @@ router.post('/generate-whatsapp-otp', async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('generate-whatsapp-otp error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
 // ─── POST /api/functions/verify-otp ──────────────────────────────────────────
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', authLimiter, async (req, res) => {
   try {
     const { identifier, code } = req.body;
     if (!identifier || !code) return res.status(400).json({ error: 'identifier e code são obrigatórios' });
@@ -1273,6 +1352,17 @@ router.post('/verify-otp', async (req, res) => {
     // Sanitize: trim whitespace from code, normalize identifier
     const cleanCode = String(code).trim();
     const cleanIdentifier = String(identifier).trim().toLowerCase();
+
+    // Rate limit: max 5 verification attempts per identifier every 15 minutes
+    if (!checkOtpRateLimit(`verify:${cleanIdentifier}`, 5, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitas tentativas de verificação. Aguarde 15 minutos.' });
+    }
+
+    // Lockout: check if identifier is locked out (30 min after 5 failed attempts)
+    const lockoutEntry = otpRateLimit.get(`lockout:${cleanIdentifier}`);
+    if (lockoutEntry && (Date.now() - lockoutEntry.firstAttempt) < 30 * 60 * 1000 && lockoutEntry.count >= 5) {
+      return res.status(429).json({ error: 'Conta temporariamente bloqueada. Tente novamente em 30 minutos.' });
+    }
 
     const result = await pool.query(
       'SELECT * FROM otp_codes WHERE identifier = $1 ORDER BY created_at DESC LIMIT 1',
@@ -1284,15 +1374,37 @@ router.post('/verify-otp', async (req, res) => {
     const otp = result.rows[0];
 
     if (otp.verified) return res.status(400).json({ error: 'Código já utilizado' });
-    if (new Date() > new Date(otp.expires_at)) return res.status(400).json({ error: 'Código expirado' });
-    if (otp.code !== cleanCode) return res.status(400).json({ error: 'Código inválido' });
+
+    // OTP expires in 5 minutes
+    const expiresAt = new Date(otp.expires_at);
+    if (new Date() > expiresAt) return res.status(400).json({ error: 'Código expirado' });
+
+    // Timing-safe comparison to prevent timing attacks
+    const otpBuffer = Buffer.from(String(otp.code).padEnd(6, '0'));
+    const codeBuffer = Buffer.from(String(cleanCode).padEnd(6, '0'));
+    const isValid = otpBuffer.length === codeBuffer.length && crypto.timingSafeEqual(otpBuffer, codeBuffer);
+
+    if (!isValid) {
+      // Track failed attempts for lockout
+      const lockKey = `lockout:${cleanIdentifier}`;
+      const lock = otpRateLimit.get(lockKey);
+      if (!lock || (Date.now() - lock.firstAttempt) > 30 * 60 * 1000) {
+        otpRateLimit.set(lockKey, { count: 1, firstAttempt: Date.now() });
+      } else {
+        lock.count++;
+      }
+      return res.status(400).json({ error: 'Código inválido' });
+    }
 
     await pool.query('UPDATE otp_codes SET verified = true WHERE identifier = $1', [cleanIdentifier]);
+
+    // Clear lockout on successful verification
+    otpRateLimit.delete(`lockout:${cleanIdentifier}`);
 
     return res.json({ success: true, verified: true });
   } catch (err) {
     console.error('verify-otp error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -1334,7 +1446,7 @@ router.post('/notify-admin-new-user', requireAuth, async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('notify-admin-new-user error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
@@ -1378,7 +1490,7 @@ router.post('/send-welcome-email', requireAuth, requireAdmin, async (req, res) =
     return res.json({ success: true });
   } catch (err) {
     console.error('send-welcome-email error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Erro interno. Tente novamente mais tarde.' });
   }
 });
 
